@@ -7,44 +7,41 @@ Danga::Socket environment
 
 =head1 SYNOPSIS
 
-   # write your worker code here:
+    # write client code in some Danga::Socket environment, e.g. Perlbal:
 
-   package MyWorkers::BlahWorker;
-   use base 'Gearman::Worker';
+    my $worker_manager = Gearman::WorkerSpawner->new;
 
-   sub new {
-       my $class = shift;
-       my $slot  = shift; # a numeric identifier for this worker
-       my $params = shift; # given below
-       my $self = Gearman::Worker->new;
-       bless $self, $class;
-       $self->register_function(blah => sub { return 42 });
-       return $self;
-   }
+    # add one or more workers
+    $worker_manager->add_worker(
+        class        => 'AdditionWorker',
+        num_workers  => 4,
+        config       => {
+            left_hand => 3,
+        },
+    );
+    $worker_manager->run_method(adder => { right_hand => 3 }, sub {
+        my $return = shift;
+        print $return->{sum};
+    });
+    Danga::Socket->EventLoop;
 
-   # and your client code in some Danga::Socket environment, e.g. Perlbal:
+    # and in the worker:
 
-   package Perlbal::Plugin::MyPlugin;
-   sub register {
-       # create one manager per process
-       my $worker_manager = Gearman::WorkerSpawner->new(
-           gearmand => 'external', # starts a gearmand
-       );
-       # add different workers
-       $worker_manager->add_worker(
-           class        => 'MyWorkers::BlahWorker',
-           num_workers  => 4,
-           worker_args  => {
-               foo => 3,
-               bar => 1.2,
-           }, # passed as second arg to MyWorkers::BlahWorker->new()
-       );
-       $svc->register_hook(
-           MyPlugin => proxy_read_request => sub {
-               $worker_manager->add_task(Gearman::Task->new(blah => '3.14'));
-           }
-       );
-   }
+    package MethodWorker;
+    use base 'Gearman::WorkerSpawner::BaseWorker';
+
+    sub new {
+        my $class = shift;
+        my $self = bless Gearman::WorkerSpawner::BaseWorker->new(@_), $class;
+        $self->register_method(adder => \&add);
+        return $self;
+    }
+
+    sub add {
+        my MethodWorker $self = shift;
+        my $args = shift;
+        return { sum => $self->{config}{left_hand} + $args->{right_hand} };
+    }
 
 =head1 DESCRIPTION
 
@@ -57,7 +54,7 @@ be created for the lifetime of the spawner.
 use strict;
 use warnings;
 
-our $VERSION = '1.03';
+our $VERSION = '2.03';
 
 use Carp qw/ croak /;
 use Danga::Socket ();
@@ -83,11 +80,11 @@ Constructor, can take the following parameters:
 =item * gearmand
 
 Specifies the location of the Gearman server to use. This may either be a comma
-separated list of host:port specs, or I<external>, which specifies that the
+separated list of host:port specs, or I<auto>, which specifies that the
 WorkerSpawner should spawn a separate process to contain a Gearman server. The
 advantage of using this over running gearmand externally is that the Gearman
-server process will halt itself in the event of the calling process' demise.
-Defaults to I<external>.
+server process will halt itself in the event of the calling process' demise;
+the disadvantage is that you give up gearmand redundancy. Defaults to I<auto>.
 
 =item * check_period
 
@@ -113,11 +110,17 @@ Along that line, only a single WorkerSpawner may be created in a process
 worker accounting impossible). As such, new() will croak if called more than
 once.
 
+=item * sigchld
+
+If true, a SIGCHLD handler is installed which immediately schedules a child
+check, rather than waiting upwards of C<check_period> seconds. Defaults to
+true.
+
 =back
 
 =item Gearman::WorkerSpawner->gearmand_pid()
 
-Returns the PID of the gearmand which was started up if I<external> was given
+Returns the PID of the gearmand which was started up if I<auto> was given
 as the C<gearmand> parameter to C<new>, or undef otherwise.
 
 =cut
@@ -138,16 +141,15 @@ sub new {
         check_period    => 1,
         perl            => $^X,
         quitting        => 0,
-        gearmand        => 'external',
+        gearmand        => 'auto',
+        sigchld         => 1,
         @_
     );
 
-    if (defined $params{gearmand}) {
-        $gearmand_spec = $params{gearmand};
-        gearman_server(); # init the server singleton if necessary
-    }
+    $gearmand_spec = $params{gearmand};
+    gearman_servers(); # init the server singleton if necessary
 
-    croak 'gearmand location not specified' unless defined $gearmand_spec;
+    croak 'gearmand location not specified' unless defined @{ gearman_servers() };
 
     # NB: this structure must be Storable-serializable for all bits used by
     # _supervise. see special handling in add_worker
@@ -168,6 +170,11 @@ sub new {
             }
         }
     }, $self->{check_period});
+
+    # restart children quickly
+    $SIG{CHLD} = sub {
+        Danga::Socket->AddTimer(0, sub { $self->_reap });
+    } if $params{sigchld};
 
     $started = 1;
 
@@ -195,17 +202,24 @@ different calls.
 =item * source
 
 (Optional) The path to the file containing the definition of 'class'; only
-necessary if the module can't be use'd.
+necessary if the module can't be use'd for some reason.
+
+=item * caller_source
+
+(Optional) If true, assume that the source for 'class' is the calling module or
+script. This will generally fail if the working directory has changed since
+program startup. This overrides I<source> if both are provided.
 
 =item * num_workers
 
 The number of worker children to spawn. If any child processes die they will be
 respawned. Defaults to 1.
 
-=item * worker_args
+=item * config
 
-An opaque data structure to pass to the child process. Must be serializable via
-Storable.
+An opaque data structure to pass to the child process, generally used to keep
+configuration that is specific to the worker but not any one job. Must be
+serializable via Storable.
 
 =back
 
@@ -291,13 +305,16 @@ sub add_worker {
                     keys %$self
                 }, __PACKAGE__;
 
+                $params{source} = (caller)[1] if $params{caller_source};
+
                 # first command is startup parameters
                 $cmd = _serialize({
                     spawner     => $storable_self,
                     class       => $class,
                     ppid        => $parent_pid,
-                    gearmand    => [gearman_server()],
+                    gearmand    => gearman_servers(),
                     source      => $params{source},
+                    inc         => \@INC,
                 });
             }
             else {
@@ -331,7 +348,7 @@ sub wait_until_all_ready {
     my Gearman::WorkerSpawner $self = shift;
     my $timeout = shift || 0.1;
 
-    my $client = Gearman::Client->new(job_servers => [gearman_server()]);
+    my $client = Gearman::Client->new(job_servers => gearman_servers());
     my $task_set = $client->new_task_set;
 
     while (my $slot = shift @open_slots) {
@@ -373,6 +390,56 @@ sub add_task {
     }
 }
 
+=item $spawner->run_method($funcname, $arg, \%options)
+
+=item $spawner->run_method($funcname, $arg, $callback)
+
+Submits a task but with less boilerplate than add_task. %options is the same as
+for add_task. Marshaling of $arg is done for you in a manner compatible with
+methods created with Gearman::WorkerSpawner::BaseWorker::register_method. The
+on_fail handler will be called if marshalling fails for some reason.
+
+If the second form is used, an empty %options is created and $callback is used
+as the on_complete handler.
+
+If the return value of the method is a scalar, a scalar reference will be
+returned to the caller.
+
+=cut
+
+sub run_method {
+    my Gearman::WorkerSpawner $self = shift;
+    my ($methodname, $arg, $options) = @_;
+
+    if (ref $options eq 'CODE') {
+        $options = { on_complete => $options };
+    }
+
+    # wrap callback with Storable marshaling of arguments
+    if (my $cb = delete $options->{on_complete}) {
+        $options->{on_complete} = sub {
+            my $ref_to_frozen_retval = shift;
+
+            if (!$ref_to_frozen_retval || ref $ref_to_frozen_retval ne 'SCALAR') {
+                $options->{on_fail}->() if exists $options->{on_fail};
+                return;
+            }
+
+            my $ret = eval { thaw($$ref_to_frozen_retval) };
+            if ($@) {
+                $options->{on_fail}->($@) && exists $options->{on_fail};
+                return;
+            }
+
+            $cb->($ret);
+        };
+    }
+
+    # serialize parameter
+    my $arg_ref = ref $arg ? $arg : \$arg;
+    _gearman_client()->add_task(Gearman::Task->new($methodname, \nfreeze($arg_ref), $options));
+}
+
 =item $spawner->stop_workers([$sig])
 
 Tell all spawned processes to quit (by default, with SIGINT).
@@ -397,19 +464,20 @@ sub DESTROY {
     $self->stop_workers unless $self->{quitting};
 }
 
-=item $spawner->gearman_server()
+=item $spawner->gearman_servers()
 
-Returns a list of server host:port specs. If an 'external' server was
-requested, its hostspec is returned.
+Returns an arrayref of server host:port specs. If an 'auto' server was
+requested, its hostspec is included.
 
 =cut
 
-# singleton server object
-my $gearman_server;
+# singleton server list
+my $gearman_servers;
 my $gearmand_pid;
-sub gearman_server {
-    unless ($gearman_server) {
-        if ($gearmand_spec eq 'external') {
+sub gearman_servers {
+    unless ($gearman_servers) {
+        use Carp; Carp::cluck("bad server list") unless defined $gearmand_spec;
+        if ($gearmand_spec eq 'auto' || $gearmand_spec eq 'external') {
             # ask OS for open listening port
             my $gearmand_port;
             eval {
@@ -431,36 +499,34 @@ sub gearman_server {
             my $pid = fork;
             die "fork failed: $!" unless defined $pid;
             if ($pid) {
-                $gearman_server = ["127.0.0.1:$gearmand_port"];
+                $gearman_servers = ["127.0.0.1:$gearmand_port"];
                 $gearmand_pid = $pid;
                 # don't return until the server is contactable
                 while (1) {
                     last if IO::Socket::INET->new(
-                        PeerAddr => $gearman_server->[0],
+                        PeerAddr => $gearman_servers->[0],
                     );
                     select undef, undef, undef, 0.1;
                 }
             }
             else {
                 $0 = 'gearmand-WorkerSpawner';
-                $gearman_server = Gearman::Server->new;
-                $gearman_server->create_listening_sock($gearmand_port);
+                Danga::Socket->Reset();
+                my $server = Gearman::Server->new;
+                $server->create_listening_sock($gearmand_port);
                 _run_periodically(sub { exit if getppid != $parent_pid }, 5);
                 Danga::Socket->EventLoop();
                 exit 0;
             }
         }
         else {
-            $gearman_server = [split /[ ,]+/, $gearmand_spec];
+            $gearman_servers = [split /[ ,]+/, $gearmand_spec];
         }
     }
-    if (wantarray && ref $gearman_server eq 'ARRAY') {
-        return @$gearman_server;
-    }
-    else {
-        return $gearman_server;
-    }
+    return $gearman_servers;
 }
+# historical alias
+*gearman_server = \&gearman_servers;
 
 sub gearmand_pid {
     return $gearmand_pid || undef;
@@ -482,7 +548,7 @@ Returns the L<Gearman::Client::Async> object used by the spawner.
 
 my $gearman_client;
 sub _gearman_client {
-    return $gearman_client ||= Gearman::Client::Async->new(job_servers => [gearman_server()]);
+    return $gearman_client ||= Gearman::Client::Async->new(job_servers => gearman_servers());
 }
 
 =item Gearman::WorkerSpawner->_supervise('My::WorkerClass', @ARGV)
@@ -512,6 +578,11 @@ sub _supervise {
     my $startup_data = <$reader>; # need this now, so allow blocking read
     my $startup_params = _unserialize($startup_data);
 
+    my %inc_exists = map { $_ => 1 } @INC;
+    for my $dir (@{ $startup_params->{inc} }) {
+        push @INC, $dir unless $inc_exists{$dir};
+    }
+
     my $worker_class = $startup_params->{class};
     $0 = sprintf "%s supervisor", $worker_class;
 
@@ -531,7 +602,7 @@ sub _supervise {
 
     my $self = $startup_params->{spawner};
 
-    $self->{gearmand} = $startup_params->{gearmand};
+    $gearman_servers = $self->{gearmand} = $startup_params->{gearmand};
     $self->{supervisor_pid} = $$;
 
     # set nonblocking since these commands come any time
@@ -608,7 +679,7 @@ sub _do_work {
 
     my $params = $slot->[SLOT_PARAMS];
     my $worker_class = $params->{class};
-    my $worker = $worker_class->new($slot->[SLOT_NUM], $params->{worker_args});
+    my $worker = $worker_class->new($slot->[SLOT_NUM], $params->{config}, gearman_servers());
 
     die "failed to create $worker_class object" unless $worker;
 
@@ -694,6 +765,12 @@ if (!caller()) {
 1;
 
 __END__
+
+=head1 BUGS
+
+=item * add_worker may sleep in attempt to recontact an unreachable supervisor
+process. This is detrimental if a worker is added after the Danga::Socket event
+loop is running.
 
 =head1 SEE ALSO
 
