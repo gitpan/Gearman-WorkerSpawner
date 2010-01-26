@@ -54,7 +54,7 @@ be created for the lifetime of the spawner.
 use strict;
 use warnings;
 
-our $VERSION = '2.03';
+our $VERSION = '2.07';
 
 use Carp qw/ croak /;
 use Danga::Socket ();
@@ -79,12 +79,13 @@ Constructor, can take the following parameters:
 
 =item * gearmand
 
-Specifies the location of the Gearman server to use. This may either be a comma
-separated list of host:port specs, or I<auto>, which specifies that the
-WorkerSpawner should spawn a separate process to contain a Gearman server. The
-advantage of using this over running gearmand externally is that the Gearman
-server process will halt itself in the event of the calling process' demise;
-the disadvantage is that you give up gearmand redundancy. Defaults to I<auto>.
+Specifies the location of the Gearman server to use. This may either be an
+array reference of host:port specs ; or a comma separated list of host:port
+specs; or I<auto>, which specifies that the WorkerSpawner should spawn a
+separate process to contain a Gearman server. The advantage of using this over
+running gearmand externally is that the Gearman server process will halt itself
+in the event of the calling process' demise; the disadvantage is that you give
+up gearmand redundancy. Defaults to I<auto>.
 
 =item * check_period
 
@@ -102,8 +103,8 @@ C<$^X>.
 WorkerSpawner periodically reaps any dead children of its running process. If
 there are non-WorkerSpawner child processes in your program, you won't know
 when they die. To be notified of such events, you can provide a subref as the
-C<reaper> parameter which will be called with the PID of any reaped children
-which don't belong to WorkerSpawner.
+C<reaper> parameter which will be called with the PID and exit code of any
+reaped children which don't belong to WorkerSpawner.
 
 Along that line, only a single WorkerSpawner may be created in a process
 (otherwise multiple spawners would race to reap each others' children, making
@@ -155,26 +156,29 @@ sub new {
     # _supervise. see special handling in add_worker
     my $self = bless \%params, $class;
 
-    # clean up any dead supervisors. might catch non-WorkerSpawner processes,
+    # clean up any dead supervisors. will also catch non-WorkerSpawner processes,
     # so fire the callback for those if provided
-    _run_periodically(sub {
+    my $child_handler = sub {
         my %reaped = $self->_reap();
         while (my ($pid, $thing) = each %reaped) {
-            if (defined $thing) {
-                if (ref $thing eq 'CODE') {
-                    $thing->();
-                }
+            if ($thing->{action}) {
+                # spawner
+                $thing->{action}->($thing->{exit_code});
             }
             elsif ($self->{reaper}) {
-                $self->{reaper}->($_);
+                # unowned child
+                $self->{reaper}->($pid, $thing->{exit_code});
             }
         }
-    }, $self->{check_period});
+    };
 
-    # restart children quickly
+    # restart children immediately if installing sigchld handler
     $SIG{CHLD} = sub {
-        Danga::Socket->AddTimer(0, sub { $self->_reap });
+        Danga::Socket->AddTimer(0, $child_handler);
     } if $params{sigchld};
+
+    # ... and/or check periodically
+    _run_periodically($child_handler, $self->{check_period});
 
     $started = 1;
 
@@ -292,8 +296,16 @@ sub add_worker {
                 $self->{supervisors}{$class} = $writer;
                 close $reader;
 
-                # invalidate cmd pipe "cache" when kid dies
-                $self->{kids}{$pid} = sub { delete $self->{supervisors}{$class} };
+                $self->{kids}{$pid}{action} = sub {
+                    # supervisor shouldn't exit; compilation of worker class probably failed
+                    my $code = shift;
+                    if ($code != 0) {
+                        die "supervisor died ($code)\n";
+                    }
+
+                    # invalidate cmd pipe "cache" when kid dies
+                    delete $self->{supervisors}{$class};
+                };
 
                 # make a serializable copy of $self
                 my $storable_self = bless {
@@ -402,9 +414,6 @@ on_fail handler will be called if marshalling fails for some reason.
 If the second form is used, an empty %options is created and $callback is used
 as the on_complete handler.
 
-If the return value of the method is a scalar, a scalar reference will be
-returned to the caller.
-
 =cut
 
 sub run_method {
@@ -421,23 +430,26 @@ sub run_method {
             my $ref_to_frozen_retval = shift;
 
             if (!$ref_to_frozen_retval || ref $ref_to_frozen_retval ne 'SCALAR') {
-                $options->{on_fail}->() if exists $options->{on_fail};
+                $options->{on_fail}->('marshaling error') if exists $options->{on_fail};
                 return;
             }
 
-            my $ret = eval { thaw($$ref_to_frozen_retval) };
+            my $rets = eval { thaw($$ref_to_frozen_retval) };
             if ($@) {
-                $options->{on_fail}->($@) && exists $options->{on_fail};
+                $options->{on_fail}->($@) if exists $options->{on_fail};
+                return;
+            }
+            elsif (ref $rets ne 'ARRAY') {
+                $options->{on_fail}->('marshaling error') if exists $options->{on_fail};
                 return;
             }
 
-            $cb->($ret);
+            $cb->(@$rets);
         };
     }
 
     # serialize parameter
-    my $arg_ref = ref $arg ? $arg : \$arg;
-    _gearman_client()->add_task(Gearman::Task->new($methodname, \nfreeze($arg_ref), $options));
+    _gearman_client()->add_task(Gearman::Task->new($methodname, \nfreeze([$arg]), $options));
 }
 
 =item $spawner->stop_workers([$sig])
@@ -477,7 +489,10 @@ my $gearmand_pid;
 sub gearman_servers {
     unless ($gearman_servers) {
         use Carp; Carp::cluck("bad server list") unless defined $gearmand_spec;
-        if ($gearmand_spec eq 'auto' || $gearmand_spec eq 'external') {
+        if (ref $gearmand_spec eq 'ARRAY') {
+            $gearman_servers = [@$gearmand_spec];
+        }
+        elsif ($gearmand_spec eq 'auto' || $gearmand_spec eq 'external') {
             # ask OS for open listening port
             my $gearmand_port;
             eval {
@@ -525,7 +540,9 @@ sub gearman_servers {
     }
     return $gearman_servers;
 }
+
 # historical alias
+no warnings 'once';
 *gearman_server = \&gearman_servers;
 
 sub gearmand_pid {
@@ -640,7 +657,8 @@ sub _check_workers {
     # reap slots from dead kids
     my %reaped = $self->_reap();
 
-    while (my ($pid, $open_slot) = each %reaped) {
+    for my $pid (keys %reaped) {
+        my $open_slot = $reaped{$pid}{slot};
         if (defined $open_slot) {
             push @open_slots, $open_slot;
         }
@@ -668,7 +686,7 @@ sub _check_workers {
         }
 
         # parent is still supervisor
-        $self->{kids}{$pid} = $slot;
+        $self->{kids}{$pid}{slot} = $slot;
     }
 }
 
@@ -744,6 +762,7 @@ sub _reap {
     my %reaped;
     while ((my $pid = waitpid(-1, WNOHANG)) > 0) {
         $reaped{$pid} = delete $self->{kids}{$pid};
+        $reaped{$pid}{exit_code} = $?;
     }
     return %reaped;
 }
