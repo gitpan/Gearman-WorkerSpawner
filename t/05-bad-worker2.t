@@ -14,7 +14,7 @@ push @INC, "$Bin/lib";
 
 open STDERR, '>', '/dev/null';
 
-$spawner->add_worker(class => 'BadWorker');
+$spawner->add_worker(class => 'BadWorker2');
 
 eval { Danga::Socket->EventLoop; };
 ok($@, 'EventLoop bailed');
