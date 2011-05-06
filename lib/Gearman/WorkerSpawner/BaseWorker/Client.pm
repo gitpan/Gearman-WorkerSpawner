@@ -9,13 +9,21 @@ with Gearman::WorkerSpawner::BaseWorker workers
 
     my $client = Gearman::WorkerSpawner::BaseWorker::Client->new;
     $client->job_servers('127.0.0.1');
+
+    # foreground job
     my @retvals = $client->run_method(adder => { right_hand => 3 });
+
+    # background job
+    $client->run_method_background(log => { message => 'beep' });
 
 =head1 DESCRIPTION
 
 This class implements the run_method function from Gearman::WorkerSpawner in
 the synchronous Gearman::Client client. Instead of calling an on_complete
 callback, the return value of the job is returned.
+
+The run_method_background method may be used to dispatch background jobs. It
+has no meaningful return value.
 
 =cut
 
@@ -32,8 +40,8 @@ sub new {
     my $ref = shift;
     my $class = ref $ref || $ref;
 
-    my Gearman::WorkerSpawner::BaseWorker::Client $self =
-        bless Gearman::Client->new(@_), $class;
+    my Gearman::WorkerSpawner::BaseWorker::Client $self = fields::new($class);
+    $self->SUPER::new(@_);
 
     $self->{method_suffix} = '_m';
 

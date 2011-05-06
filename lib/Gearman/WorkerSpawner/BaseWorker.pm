@@ -37,8 +37,10 @@ creating a Gearman worker for use with Gearman::WorkerSpawner
     # Gearman::WorkerSpawner will instantiate your class; the object will
     # contain populated 'config' and 'slot' fields
     sub new {
-        my $class = shift;
-        my MethodWorker $self = bless $self->SUPER::new(@_), $class;
+        my MethodWorker $self = shift;
+        $self = fields::new($self) unless ref $self;
+        $self->SUPER::new(@_);
+
         print "I am worker $self->{slot}\n";
         $self->register_method(adder => \&add);
         return $self;
@@ -70,10 +72,11 @@ use fields (
 use Storable qw(nfreeze thaw);
 
 sub new {
-    my ($this, $slot, $config, $gearmands, $max_jobs) = @_;
+    my Gearman::WorkerSpawner::BaseWorker $self = shift;
+    my ($slot, $config, $gearmands, $max_jobs) = @_;
 
-    my $class = ref $this || $this;
-    my Gearman::WorkerSpawner::BaseWorker $self = Gearman::Worker->new(job_servers => $gearmands);
+    $self = fields::new($self) unless ref $self;
+    $self->SUPER::new(job_servers => $gearmands);
 
     $self->{slot}           = $slot;
     $self->{config}         = $config;
@@ -81,7 +84,7 @@ sub new {
     $self->{jobs_done}      = 0;
     $self->{method_suffix}  = '_m';
 
-    return bless $self, $class;
+    return $self;
 }
 
 =head1 METHODS
